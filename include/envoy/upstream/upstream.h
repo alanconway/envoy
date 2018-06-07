@@ -677,6 +677,11 @@ public:
    */
   virtual bool drainConnectionsOnHostRemoval() const PURE;
 
+  /**
+   * Create network filters on a new upstream connection.
+   */
+  virtual void createNetworkFilters(Network::Connection& connection) const PURE;
+
 protected:
   /**
    * Invoked by extensionProtocolOptionsTyped.

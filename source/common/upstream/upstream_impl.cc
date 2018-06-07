@@ -35,6 +35,7 @@
 #include "common/upstream/logical_dns_cluster.h"
 #include "common/upstream/original_dst_cluster.h"
 
+#include "server/configuration_impl.h" // TODO(alanconway): bad dependency
 #include "server/transport_socket_config_impl.h"
 
 #include "extensions/transport_sockets/well_known_names.h"
@@ -183,6 +184,7 @@ HostImpl::createConnection(Event::Dispatcher& dispatcher, const ClusterInfo& clu
       cluster.transportSocketFactory().createTransportSocket(transport_socket_options),
       connection_options);
   connection->setBufferLimits(cluster.perConnectionBufferLimitBytes());
+  cluster.createNetworkFilters(*connection);
   return connection;
 }
 
@@ -357,6 +359,31 @@ ClusterLoadReportStats ClusterInfoImpl::generateLoadReportStats(Stats::Scope& sc
   return {ALL_CLUSTER_LOAD_REPORT_STATS(POOL_COUNTER(scope))};
 }
 
+// TODO(alanconway): dummy factory context, how do we implement this?  Some of
+// the methods are listener specific, should they throw, return null values, return
+// values derived from the Cluster or be moved/removed?
+class ClusterInfoImpl::FactoryContextImpl : public Server::Configuration::FactoryContext {
+  virtual AccessLog::AccessLogManager& accessLogManager() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Upstream::ClusterManager& clusterManager() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Event::Dispatcher& dispatcher() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual const Network::DrainDecision& drainDecision() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual bool healthCheckFailed() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Tracing::HttpTracer& httpTracer() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Init::Manager& initManager() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual const LocalInfo::LocalInfo& localInfo() const PURE;
+  virtual Envoy::Runtime::RandomGenerator& random() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Envoy::Runtime::Loader& runtime() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Stats::Scope& scope() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Singleton::Manager& singletonManager() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual ThreadLocal::SlotAllocator& threadLocal() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Server::Admin& admin() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Stats::Scope& listenerScope() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual const envoy::api::v2::core::Metadata& listenerMetadata() const PURE;
+  virtual TimeSource& timeSource() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Server::OverloadManager& overloadManager() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+  virtual Http::Context& httpContext() { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
+};
+
 ClusterInfoImpl::ClusterInfoImpl(const envoy::api::v2::Cluster& config,
                                  const envoy::api::v2::core::BindConfig& bind_config,
                                  Runtime::Loader& runtime,
@@ -431,6 +458,29 @@ ClusterInfoImpl::ClusterInfoImpl(const envoy::api::v2::Cluster& config,
   // https://github.com/lyft/protoc-gen-validate/issues/97 resolved. This just provides early
   // validation of sanity of fields that we should catch at config ingestion.
   DurationUtil::durationToMilliseconds(common_lb_config_.update_merge_window());
+
+  // Create upstream filter factories
+  auto filters = config.filters();
+  for (ssize_t i = 0; i < filters.size(); i++) {
+    const auto& proto_config = filters[i];
+    const ProtobufTypes::String name = proto_config.name();
+    const Json::ObjectSharedPtr filter_config =
+        MessageUtil::getJsonObjectFromMessage(proto_config.config());
+    ENVOY_LOG(debug, "filter #{} name: {} config: {}", i, name, filter_config->asJsonString());
+    // Now see if there is a factory that will accept the config.
+    auto& factory =
+        Config::Utility::getAndCheckFactory<Server::Configuration::NamedNetworkFilterConfigFactory>(
+            name);
+    Network::FilterFactoryCb callback;
+    if (filter_config->getBoolean("deprecated_v1", false)) {
+      callback =
+          factory.createFilterFactory(*filter_config->getObject("value", true), *factory_context_);
+    } else {
+      auto message = Config::Utility::translateToFactoryConfig(proto_config, factory);
+      callback = factory.createFilterFactoryFromProto(*message, *factory_context_);
+    }
+    filter_factories_.push_back(callback);
+  }
 }
 
 ProtocolOptionsConfigConstSharedPtr
@@ -474,6 +524,10 @@ Network::TransportSocketFactoryPtr createTransportSocketFactory(
   ProtobufTypes::MessagePtr message =
       Config::Utility::translateToFactoryConfig(transport_socket, config_factory);
   return config_factory.createTransportSocketFactory(*message, factory_context);
+}
+
+void ClusterInfoImpl::createNetworkFilters(Network::Connection& connection) const {
+  Server::Configuration::FilterChainUtility::buildFilterChain(connection, filter_factories_);
 }
 
 ClusterSharedPtr ClusterImplBase::create(
